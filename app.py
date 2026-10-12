@@ -2,9 +2,16 @@ from flask import Flask, render_template, request, redirect, url_for, session, f
 import sqlite3, os, time
 from functools import wraps
 import werkzeug
+from werkzeug.security import generate_password_hash, check_password_hash
+import secrets
 
 app = Flask(__name__)
-app.secret_key = "supersecretkey"   # replace with env var in production
+app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get("COOKIE_SECURE", "false").lower() == "true"
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB upload limit
+ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov", ".m4v", ".avi"}
 DB_FILE = "buzz.db"
 
 UPLOAD_FOLDER = "static/uploads"
@@ -128,14 +135,18 @@ def premium_required(f):
 @app.route("/signup", methods=["GET", "POST"])
 def signup():
     if request.method == "POST":
-        username = request.form["username"]
-        password = request.form["password"]
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
+        if not username or len(username) > 40 or len(password) < 8:
+            flash("Enter a username (up to 40 characters) and a password of at least 8 characters.", "danger")
+            return render_template("signup.html")
 
         conn = get_db()
         cur = conn.cursor()
         try:
             cur.execute("INSERT INTO users (username, password, premium) VALUES (?, ?, ?)",
-                        (username, password, 0))
+                        (username, generate_password_hash(password), 0))
             conn.commit()
             flash("Signup successful! Please log in.", "success")
             return redirect(url_for("login"))
@@ -149,16 +160,33 @@ def signup():
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        username = request.form["username"]
-        password = request.form["password"]
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
 
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("SELECT * FROM users WHERE username=? AND password=?", (username, password))
+        cur.execute("SELECT * FROM users WHERE username=?", (username,))
         user = cur.fetchone()
+
+        valid_password = False
+        if user:
+            stored_password = user["password"] or ""
+            if stored_password.startswith(("scrypt:", "pbkdf2:")):
+                try:
+                    valid_password = check_password_hash(stored_password, password)
+                except (ValueError, TypeError):
+                    valid_password = False
+            else:
+                # Migrate legacy plaintext passwords after a successful login.
+                valid_password = secrets.compare_digest(stored_password, password)
+                if valid_password:
+                    cur.execute("UPDATE users SET password=? WHERE username=?",
+                                (generate_password_hash(password), username))
+                    conn.commit()
         conn.close()
 
-        if user:
+        if user and valid_password:
+            session.clear()
             session["user"] = user["username"]
             session["admin"] = (user["username"] == "admin")
             session["login_time"] = int(time.time())
@@ -230,7 +258,14 @@ def upload():
             flash("No file selected.", "danger")
             return redirect(url_for("upload"))
 
-        filename = werkzeug.utils.secure_filename(file.filename)
+        original_name = werkzeug.utils.secure_filename(file.filename)
+        extension = os.path.splitext(original_name)[1].lower()
+        if extension not in ALLOWED_VIDEO_EXTENSIONS:
+            flash("Unsupported file type. Upload an MP4, WebM, MOV, M4V, or AVI video.", "danger")
+            return redirect(url_for("upload"))
+
+        # A random stored name prevents collisions and avoids trusting user-supplied paths.
+        filename = f"{secrets.token_hex(16)}{extension}"
         save_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
         file.save(save_path)
 
