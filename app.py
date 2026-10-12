@@ -37,6 +37,11 @@ def init_db():
         )
     """)
 
+    # Explicit role flag: never grant admin rights based on a username.
+    columns = {row["name"] for row in cur.execute("PRAGMA table_info(users)").fetchall()}
+    if "is_admin" not in columns:
+        cur.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
+
     # Videos
     cur.execute("""
         CREATE TABLE IF NOT EXISTS videos (
@@ -188,7 +193,7 @@ def login():
         if user and valid_password:
             session.clear()
             session["user"] = user["username"]
-            session["admin"] = (user["username"] == "admin")
+            session["admin"] = bool(user["is_admin"])
             session["login_time"] = int(time.time())
             flash("Login successful!", "success")
             return redirect(url_for("home"))
